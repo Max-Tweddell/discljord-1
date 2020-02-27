@@ -1,14 +1,18 @@
-(defproject discljord "0.1.0-SNAPSHOT"
-  :description "A Clojure library to allow the creation of Discord bots with a relatively high level of abstraction."
-  :url "http://example.com/FIXME"
+(defproject org.suskalo/discljord "0.2.7"
+  :description " A Clojure wrapper library for the Discord API, with full API coverage (except voice, for now), and high scalability."
+  :url "https://github.com/IGJoshua/discljord"
   :license {:name "Eclipse Public License"
             :url "http://www.eclipse.org/legal/epl-v10.html"}
-  :dependencies [[org.clojure/clojure "1.9.0"]
+  :dependencies [[org.clojure/clojure "1.10.1"]
+                 [org.clojure/core.async "0.4.490"]
                  [org.clojure/data.json "0.2.6"]
-                 [http-kit "2.2.0"]
-                 [http-kit.fake "0.2.2"]
-                 [stylefruits/gniazdo "1.0.1"]
-                 [org.clojure/core.async "0.3.442"]
-                 [com.rpl/specter "1.0.5"]]
+                 [com.taoensso/timbre "4.10.0"]
+                 [http-kit "2.4.0-alpha3"]
+                 [stylefruits/gniazdo "1.1.3"]
+                 [com.rpl/specter "1.1.2"]]
   :target-path "target/%s"
-  :profiles {:uberjar {:aot :all}})
+  :jar-name "discljord-%s.jar"
+  :deploy-branches ["master" "release"]
+  :profiles {:dev {:dependencies [[http-kit.fake "0.2.2"]]
+                   :plugins [[lein-codox "0.10.6"]]
+                   :exclusions [http-kit]}})

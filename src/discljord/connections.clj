@@ -1,216 +1,136 @@
 (ns discljord.connections
-  (:require [org.httpkit.client :as http]
-            [clojure.data.json :as json]
-            [gniazdo.core :as ws]
-            [clojure.core.async :as a]
-            [clojure.spec.alpha :as s]
-            [clojure.string :as str]
-            [com.rpl.specter :refer :all]))
+  "Namespace for creating a connection to Discord, and recieving messages.
+  Contains functionality required to create and maintain a sharded and auto-reconnecting
+  connection object which will recieve messages from Discord, and pass them on to client
+  code."
+  (:require
+   [clojure.core.async :as a]
+   [clojure.spec.alpha :as s]
+   [discljord.connections.impl :as impl]
+   [discljord.connections.specs :as cs]
+   [discljord.http :refer [gateway-url]]
+   [discljord.specs :as ds]
+   [discljord.util :refer [bot-token]]
+   [taoensso.timbre :as log]))
 
-(s/def ::url string?)
-(s/def ::shard-count int?)
-(s/def ::gateway (s/nilable (s/keys :req-un [::url ::shard-count])))
-(s/def ::shard-id int?)
-(s/def ::socket-state any?)
-(s/def ::shard (s/keys :req-un [::gateway ::shard-id ::socket-state]))
-(s/def ::shards (s/coll-of ::shard))
+(defn connect-bot!
+  "Creates a connection process which will handle the services granted by
+  Discord which interact over websocket.
 
-(defn append-api-suffix
-  [url]
-  (str url "?v=6&encoding=json"))
-(s/fdef append-api-suffix
-        :args (s/cat :url ::url)
-        :ret ::url)
+  Takes a token for the bot, and a channel on which all events from Discord
+  will be sent back across.
 
-(defn api-url
-  [gateway]
-  (append-api-suffix (str "https://discordapp.com/api" gateway)))
-(s/fdef api-url
-        :args (s/cat :gateway string?)
-        :ret ::url)
+  Returns a channel used to communicate with the process and send packets to
+  Discord.
 
-(defn get-websocket-gateway!
-  [url token]
-  (if-let [result (try (into {} (mapv (fn [[k v]] [(if (= k "shards")
-                                                     :shard-count
-                                                     (keyword k)) v])
-                                      (vec (json/read-str (:body @(http/get url
-                                                                    {:headers {"Authorization" token}}))))))
-                       (catch Exception e
-                         nil))]
-    (when (:url result)
-      result)))
-(s/fdef get-websocket-gateway!
-        :args (s/cat :url ::url :token string?)
-        :ret ::gateway)
+  Keep in mind that Discord sets a limit to how many shards can connect in a
+  given period. This means that communication to Discord may be bounded based
+  on which shard you use to talk to the server immediately after starting the bot.
 
-(defn create-shard
-  [gateway shard-id]
-  {:gateway gateway :shard-id shard-id :socket-state (atom {:ack? true :keep-alive true})})
-(s/fdef create-shard
-        :args (s/cat :gateway ::gateway :shard-id ::shard-id)
-        :ret ::shard)
+  The `buffer-size` parameter is deprecated, and will be ignored."
+  [token out-ch & {:keys [buffer-size]}]
+  (let [token (bot-token token)
+        {:keys [url shard-count session-start-limit]}
+        (impl/get-websocket-gateway gateway-url token)]
+    (if (and url shard-count session-start-limit)
+      (do (when (< (:remaining session-start-limit) shard-count)
+            (throw (ex-info "Not enough remaining identify packets for number of shards."
+                            {:token token
+                             :shard-count shard-count
+                             :remaining-starts (:remaining session-start-limit)
+                             :reset-after (:reset-after session-start-limit)})))
+          (let [communication-chan (a/chan 100)]
+            (impl/connect-shards! out-ch communication-chan url token shard-count (range shard-count))
+            communication-chan))
+      (log/debug "Unable to recieve gateway information."))))
+(s/fdef connect-bot!
+  :args (s/cat :token ::ds/token :out-ch ::ds/channel
+               :keyword-args (s/keys* :opt-un [::cs/buffer-size]))
+  :ret ::ds/channel)
 
-(defn json-keyword
-  [s]
-  (keyword (str/replace (str/lower-case s) #"_" "-")))
-(s/fdef json-keyword
-        :args (s/cat :str string?)
-        :ret keyword?)
+(defn disconnect-bot!
+  "Takes the channel returned by connect-bot! and stops the connection."
+  [connection-ch]
+  (a/put! connection-ch [:disconnect])
+  nil)
+(s/fdef disconnect-bot!
+  :args (s/cat :channel ::ds/channel)
+  :ret nil?)
 
-(defn clean-json-input
-  [j]
-  (cond
-    (map? j) (->> j
-                  (transform [MAP-KEYS] clean-json-input)
-                  (transform [MAP-VALS coll?] clean-json-input))
-    (string? j) (json-keyword j)
-    (vector? j) (mapv clean-json-input j)
-    :else j))
-(s/fdef clean-json-input
-        :args any?
-        :ret any?)
+(defn guild-request-members!
+  "Takes the channel returned by connect-bot!, the snowflake guild id, and optional arguments
+  about the members you want to get information about, and signals Discord to send you
+  :guild-members-chunk events.
 
-(defn heartbeat
-  [socket s]
-  (ws/send-msg socket (json/write-str {"op" 1 "d" s})))
+  Keyword Arguments:
+  query: a string that the username of the searched user starts with, or empty string for all users, defaults to empty string
+  limit: the maximum number of members to give based on the query"
+  [connection-ch guild-id & args]
+  (a/put! connection-ch (apply vector :guild-request-members :guild-id guild-id args)))
+(s/fdef guild-request-members!
+  :args (s/cat :channel ::ds/channel
+               :guild-id ::ds/snowflake
+               :keyword-args (s/keys* :opt-un [::cs/query
+                                               ::cs/limit])))
 
-(declare connect-websocket)
+(defn create-activity
+  "Takes keyword arguments and constructs an activity to be used in status updates.
 
-(defn disconnect-websocket
-  [socket-state]
-  (ws/close (:socket @socket-state))
-  (swap! socket-state #(-> %
-                           (dissoc :socket)
-                           (assoc :keep-alive false))))
+  Keyword Arguments:
+  name: a string which will display as the bot's status message, required
+  type: keywords :game, :stream, :music, or :watch which change how the status message displays, as \"Playing\", \"Streaming\", \"Listening to\", or \"Watching\" respectively, defaults to :game. You can also pass the number of the discord status type directly if it isn't listed here.
+  url: link to display with the :stream type, currently only urls starting with https://twitch.tv/ will work, defaults to nil"
+  [& {:keys [name type url] :or {type :game} :as args}]
+  (let [args (into {} (filter (fn [[key val]] val) args))
+        args (if (:type args)
+               args
+               (assoc args :type :game))
+        type (if (number? type)
+               type
+               (case type
+                 :game 0
+                 :stream 1
+                 :music 2
+                 :watch 3))]
+    (assert (:name args) "A name should be provided to an activity")
+    (assoc args :type type)))
+(s/fdef create-activity
+  :args (s/keys* :req-un [::cs/name]
+                 :opt-un [::cs/type
+                          ::ds/url])
+  :ret ::cs/activity)
 
-(defn reconnect-websocket
-  [gateway token shard-id event-channel socket-state resume]
-  (a/go (ws/close (:socket @socket-state))
-        (swap! socket-state #(-> %
-                                 (assoc :keep-alive false)
-                                 (assoc :ack? true)
-                                 (assoc :resume resume)
-                                 (dissoc :socket)))
-        (a/<! (a/timeout 100))
-        (swap! socket-state #(-> %
-                                 (assoc :socket (connect-websocket
-                                                 gateway token shard-id
-                                                 event-channel socket-state))
-                                 (assoc :keep-alive true)))))
+(defn status-update!
+  "Takes the channel returned by connect-bot! and a set of keyword options, and updates
+  Discord with a new status for your bot.
 
-(defn connect-websocket
-  [gateway token shard-id event-channel socket-state]
-  (ws/connect (:url gateway)
-    :on-connect (fn [_]
-                  (println "Connected!")
-                  (println "Sending connection packet. Resume:" (:resume @socket-state))
-                  (if-not (:resume @socket-state)
-                   (ws/send-msg (:socket @socket-state) (json/write-str
-                                                         {"op" 2
-                                                          "d" {"token" token
-                                                               "properties"
-                                                               {"$os" "linux"
-                                                                "$browser" "discljord"
-                                                                "$device" "discljord"}
-                                                               "compress" false
-                                                               "large_threshold" 250
-                                                               "shard" [shard-id (:shard-count gateway)]
-                                                               "presence"
-                                                               (:presence @socket-state)}}))
-                   (ws/send-msg (:socket @socket-state) (json/write-str
-                                                         {"op" 6
-                                                          "d" {"token" token
-                                                               "session_id" (:session @socket-state)
-                                                               "seq" (:seq @socket-state)}})))
-                  (a/go-loop [continue true]
-                    (when (and continue (:ack? @socket-state))
-                      (if-let [interval (:hb-interval @socket-state)]
-                        (do (heartbeat (:socket @socket-state) (:seq @socket-state))
-                            (println "Sending heartbeat from usual route")
-                            (swap! socket-state assoc :ack? false)
-                            (a/<! (a/timeout interval))
-                            (recur (:keep-alive @socket-state)))
-                        (do (a/<! (a/timeout 100))
-                            (recur (:keep-alive @socket-state)))))))
-    :on-receive (fn [msg]
-                  #_(println "Message recieved:" msg)
-                  (let [msg (json/read-str msg)
-                        op (get msg "op")]
-                    (case op
-                      ;; This is the initial payload that is sent, the "Hello" payload
-                      10 (let [d (get msg "d")
-                               interval (get d "heartbeat_interval")]
-                           (swap! socket-state #(-> %
-                                                    (assoc :hb-interval interval)
-                                                    (assoc :ack? true))))
-                      ;; These payloads occur when the server requests a heartbeat
-                      1 (do (println "Sending heartbeat from server response")
-                            (heartbeat (:socket @socket-state) (:seq @socket-state)))
-                      ;; This is the server's response to a heartbeat
-                      11 (swap! socket-state assoc :ack? true)
-                      ;; This is the payload that contains events to be responded to
-                      0 (a/go (let [t (json-keyword (get msg "t"))
-                                    d (get msg "d")
-                                    s (get msg "s")]
-                                #_(println "type" t "data" d "seq" s)
-                                (if-let [session (get d "session_id")]
-                                  (swap! socket-state #(-> %
-                                                           (assoc :seq s)
-                                                           (assoc :session session)))
-                                  (swap! socket-state assoc :seq s))
-                                (a/>! event-channel {:event-type t :event-data (clean-json-input d)})))
-                      ;; This is the restart connection one
-                      7 (reconnect-websocket gateway token shard-id event-channel socket-state true)
-                      ;; This is the invalid session response
-                      9 (a/go (if (get msg "d")
-                                (reconnect-websocket gateway token
-                                                     shard-id event-channel
-                                                     socket-state true)
-                                (reconnect-websocket gateway token
-                                                     shard-id event-channel
-                                                     socket-state false)))
-                      ;; This is what happens if there was a unknown payload
-                      (println "Unhandled response from server:" op))))
-    :on-close (fn [stop-code msg]
-                (println "Connection closed. code:" stop-code "\nmessage:" msg)
-                (case stop-code
-                  ;; Unknown error
-                  4000 (reconnect-websocket gateway token
-                                            shard-id event-channel
-                                            socket-state true)
-                  4001 (a/go (disconnect-websocket socket-state)
-                           (a/>! event-channel {:event-type :disconnect :event-data nil})
-                           (throw (Exception. "Invalid gateway opcode sent to server")))
-                  4002 (a/go (disconnect-websocket socket-state)
-                             (a/>! event-channel {:event-type :disconnect :event-data nil})
-                             (throw (Exception. "Invalid payload send to server")))
-                  4003 (a/go (disconnect-websocket socket-state)
-                             (a/>! event-channel {:event-type :disconnect :event-data nil})
-                             (throw (Exception. "Payload sent to server before Identify payload")))
-                  4004 (a/go (disconnect-websocket socket-state)
-                             (a/>! event-channel {:event-type :disconnect :event-data nil})
-                             (throw (Exception. "Invalid token")))
-                  4005 (a/go (disconnect-websocket socket-state)
-                             (a/>! event-channel {:event-type :disconnect :event-data nil})
-                             (throw (Exception. "Multiple Identify payloads sent")))
-                  ;; Invalid seq
-                  4007 (reconnect-websocket gateway token
-                                            shard-id event-channel
-                                            socket-state false)
-                  4008 (a/go (disconnect-websocket socket-state)
-                             (a/>! event-channel {:event-type :disconnect :event-data nil})
-                             (throw (Exception. "Rate limit reached")))
-                  ;; Session timed out
-                  4009 (reconnect-websocket gateway token
-                                            shard-id event-channel
-                                            socket-state false)
-                  4010 (a/go (disconnect-websocket socket-state)
-                             (a/>! event-channel {:event-type :disconnect :event-data nil})
-                             (throw (Exception. "Invalid shard sent")))
-                  4011 (a/go (disconnect-websocket socket-state)
-                             (a/>! event-channel {:event-type :disconnect :event-data nil})
-                             (throw (Exception. "Sharding required")))
-                  (println "Unknown stop code"))
-                (swap! socket-state dissoc :socket))))
+  Keyword Arguments:
+  idle-since: epoch time in milliseconds of when the bot went idle, defaults to nil
+  activity: an activity map, from create-activity, which is used for the bot, defaults to nil
+  status: a keyword representing the current status of the bot, can be :online, :dnd, :idle, :invisible, or :offline, defaults to :online
+  afk: a boolean to say if the bot is afk, defaults to false"
+  [connection-ch & args]
+  (a/put! connection-ch (apply vector :status-update args)))
+(s/fdef status-update!
+  :args (s/cat :channel ::ds/channel
+               :keyword-args (s/keys* :opt-un [::cs/idle-since
+                                               ::cs/activity
+                                               ::cs/status
+                                               ::cs/afk])))
 
+(defn voice-state-update!
+  "Takes the channel returned by connect-bot!, a guild id, and a set of keyword options and
+  updates Discord with a new voice state.
+
+  Keyword Arguments:
+  channel-id: the new channel id snowflake that your bot is in, disconnect if nil, defaults to nil
+  mute: boolean which says if the bot is muted
+  deaf: boolean which says if the bot is deafened"
+  [connection-ch guild-id & args]
+  (a/put! connection-ch (apply vector :voice-state-update :guild-id guild-id args)))
+(s/fdef voice-state-update!
+  :args (s/cat :channel ::ds/channel
+               :guild-id ::ds/snowflake
+               :keyword-args (s/keys* :opt-un [::ds/channel-id
+                                               ::cs/mute
+                                               ::cs/deaf])))
